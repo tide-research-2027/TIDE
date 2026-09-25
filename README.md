@@ -29,7 +29,7 @@ experiment uses Qwen3-4B and Qwen3-8B, respectively.
 | `prepare_benchmarks.py` | Exact five-benchmark evaluation constructors and paper sizes |
 | `tide_evaluate.py` | Generation, fixed-judge evaluation, and metrics |
 | `faithfulness_judge.py` | Context faithfulness with a fixed Qwen judge |
-| `kl_divergence.py` | Token-weighted full-vocabulary `KL(base || trained)` |
+| `kl_divergence.py` | Full-vocabulary forward `KL(base || trained)` analysis |
 | `deepspeed_zero3.json` | Full-parameter ZeRO-3 configuration |
 | `deepspeed_zero3_offload.json` | Full-parameter ZeRO-3 CPU-offload configuration |
 
@@ -292,13 +292,8 @@ python faithfulness_judge.py \
 
 ## Distributional Shift
 
-The KL script computes the full-vocabulary forward divergence at every retained
-generated-answer position, conditioned on the same prompt and response prefix:
-
-```text
-D_i,t = KL(pi_base(.|X_i,y_i,<t) || pi_trained(.|X_i,y_i,<t))
-KL_hat = sum_i sum_t D_i,t / sum_i T_i
-```
+The KL script estimates the full-vocabulary forward divergence from the base
+model to a trained model on generated responses.
 
 ```bash
 python kl_divergence.py \
