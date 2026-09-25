@@ -2,199 +2,287 @@
 
 **Target Optimization with Implicit Distillation for ContExt-Grounded RAG**
 
-Code accompanying **Grounded without Drifting from Pretraining: Rollout-Free Target Optimization with Implicit Distillation for RAG**.
+Official implementation of **Grounded without Drifting from Pretraining:
+Rollout-Free Target Optimization with Implicit Distillation for RAG**.
 
-## Overview
-
-TIDE is a rollout-free approach to post-training retrieval-augmented language models. It retains human-written supervision while weighting training examples according to:
-
-- Compatibility with the pretrained model.
-- Faithfulness to the retrieved context.
-
-The implementation computes a value for each response and converts it into a training weight:
+TIDE performs full-parameter post-training with response-level weights derived
+from pretrained-policy compatibility and context faithfulness:
 
 ```text
-value = mean answer-token log probability + NLI entailment probability
-raw_weight = exp(alpha * value)
-weight = raw_weight / mean(raw_weight)
+V(X,y) = mean_answer_token_log_probability_base(y|X) + entailment(context,y)
+w(X,y) = exp(alpha * V(X,y))
+L = mean_i w_i * mean_answer_tokens[-log pi_theta(y_i|X_i)]
 ```
 
-Training minimizes the weighted, length-normalized response loss. Prompt and padding tokens are excluded. At `alpha = 0`, the weights become uniform and the objective reduces to supervised fine-tuning.
+The default experiment uses `alpha=0.5`, Qwen3-14B as the policy, and
+`MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli` during target
+weight construction. Evaluation uses Qwen3-32B as a fixed judge. The smaller
+experiment uses Qwen3-4B and Qwen3-8B, respectively.
 
-## Repository Contents
+## Files
 
-| File | Description |
-| --- | --- |
-| `tide_train.py` | Computes TIDE weights and performs full-model fine-tuning. |
-| `self-demo.py` | Runs the Self-Demo baseline, including demonstration generation, selection, and training. |
-| `tide_evaluate.py` | Generates responses and evaluates reference overlap and fixed-judge decisions. |
-| `faithfulness_judge.py` | Scores context faithfulness using a fixed Qwen judge. |
-| `kl_divergence.py` | Computes full-vocabulary KL divergence between the base and trained models along generated responses. |
+| File | Purpose |
+|---|---|
+| `tide_train.py` | TIDE/FIND, SFT, Less-Value, and Faith-Only full-model training |
+| `self_demo.py` | Prompt optimization, Self-Demo generation, tournament selection, and training |
+| `prepare_dataset.py` | Dataset-independent conversion to canonical QA JSONL |
+| `tide_evaluate.py` | Generation, Qwen judging, deterministic validity checks, and metrics |
+| `faithfulness_judge.py` | Context faithfulness with a fixed Qwen judge |
+| `kl_divergence.py` | Token-weighted full-vocabulary `KL(base || trained)` |
+| `deepspeed_zero3.json` | Full-parameter ZeRO-3 configuration |
+| `deepspeed_zero3_offload.json` | Full-parameter ZeRO-3 CPU-offload configuration |
 
-## Setup
+## Environment
 
-Install PyTorch appropriate for your CUDA environment, then install the core dependencies:
+Training and Transformers evaluation:
 
 ```bash
-python -m pip install transformers datasets accelerate tqdm numpy sentencepiece bitsandbytes
+conda create -n tide python=3.11 -y
+conda activate tide
+python -m pip install -r requirements.txt
 ```
 
-Use a Transformers version supporting Qwen3. Self-Demo generation additionally requires a compatible vLLM installation. DeepSpeed is optional when supplying a configuration.
-
-Dependency versions are not currently pinned. Large-model fine-tuning and evaluation require substantial GPU memory; adjust model sizes and batch sizes to your hardware.
-
-## TIDE Training
-
-Example using Qwen3-4B on MSMARCO:
+Self-Demo generation uses a separate vLLM environment:
 
 ```bash
-python tide_train.py \
-  --dataset msmarco \
-  --base-model Qwen/Qwen3-4B \
-  --alpha 0.5 \
-  --max-samples 75000 \
-  --weighted-jsonl runs/tide_msmarco/weighted.jsonl \
-  --output-dir runs/tide_msmarco/model
+conda create -n tide-vllm python=3.11 -y
+conda activate tide-vllm
+python -m pip install -r requirements-vllm.txt
 ```
 
-The default base model is `Qwen/Qwen3-14B`.
+## Canonical Data Schema
 
-The training faithfulness scorer defaults to:
-
-```text
-MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli
-```
-
-This NLI score is used to construct training weights. It is separate from the Qwen-based faithfulness evaluation described below.
-
-Use `--dataset newsqa` for the implemented NewsQA loader. Dataset access and schemas must match the script's loaders. The sample limit is applied before filtering, so the retained training set may contain fewer examples.
-
-To reuse computed weights, add:
-
-```bash
---reuse-weighted-jsonl
-```
-
-Only reuse a cache when the dataset, base model, faithfulness scorer, and alpha match the intended run.
-
-For uniform-weight SFT, use `--alpha 0` with a fresh cache and output directory. The current script still runs the scoring stage.
-
-View all options:
-
-```bash
-python tide_train.py --help
-```
-
-## Self-Demo Baseline
-
-Self-Demo generates and selects model-produced demonstrations before fine-tuning.
-
-```bash
-python self-demo.py \
-  --dataset msmarco \
-  --stage all \
-  --base-model Qwen/Qwen3-4B \
-  --run-tag self_demo_qwen3_4b \
-  --data-root runs/self_demo_qwen3_4b/data \
-  --cache-root runs/self_demo_qwen3_4b/cache \
-  --output-dir runs/self_demo_qwen3_4b/model
-```
-
-Available stages are:
-
-- `prepare`: prepare training data.
-- `vllm`: run demonstration generation and selection.
-- `train`: fine-tune using prepared demonstrations.
-- `all`: run the full pipeline.
-
-A separate vLLM Python environment can be specified with `--vllm-python`.
-
-```bash
-python self-demo.py --help
-```
-
-## Answer Generation and Evaluation
-
-Prepare evaluation data as JSONL, with one example per line:
+Training and evaluation artifacts use JSONL with one object per line:
 
 ```json
-{"id":"example-1","question":"What is the capital of France?","context":"Paris is the capital of France.","answers":["Paris"]}
+{"id":"example-1","question":"What is the capital of France?","context":"Paris is the capital of France.","answers":["Paris"],"answer":"Paris","metadata":{}}
 ```
 
-Run generation and validation:
+Convert JSONL, JSON, CSV/TSV, or Hugging Face data:
+
+```bash
+python prepare_dataset.py \
+  --input-file raw/evaluation.jsonl \
+  --output-dir data/prepared \
+  --output-prefix evaluation \
+  --id-field id \
+  --question-field question \
+  --context-field context \
+  --answers-field answers \
+  --require-answer --require-context --deduplicate
+```
+
+Nested passage collections and selected-passage flags are supported:
+
+```bash
+python prepare_dataset.py \
+  --input-file raw/data.jsonl \
+  --output-dir data/prepared \
+  --output-prefix selected \
+  --question-field query \
+  --context-field passages \
+  --answers-field answers \
+  --passage-text-field passage_text \
+  --passage-selected-field is_selected \
+  --selected-value 1 \
+  --require-answer-in-context
+```
+
+Preparation writes a JSON summary containing accepted/skipped counts, output
+paths, seed, and schema. Preserve this summary with every experiment.
+
+## Full-Parameter Training
+
+All methods use the same base model, optimizer settings, learning rate,
+effective batch construction, epoch count, seed, and data loader. No LoRA,
+QLoRA, or PEFT adapter is used.
+
+### TIDE
+
+```bash
+torchrun --standalone --nproc_per_node=8 tide_train.py \
+  --dataset msmarco --mode find \
+  --base-model Qwen/Qwen3-14B \
+  --nli-model MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli \
+  --alpha 0.5 --max-samples 75000 --seed 42 \
+  --weighted-jsonl runs/msmarco/tide/weighted.jsonl \
+  --output-dir runs/msmarco/tide/model \
+  --deepspeed deepspeed_zero3.json
+```
+
+For NewsQA, change `--dataset newsqa` and the output paths.
+
+### Baselines and ablations
+
+Use the identical command and change only `--mode`:
+
+```bash
+# Uniform-weight supervised fine-tuning
+--mode sft
+
+# Pretrained log-probability component only
+--mode less_value --alpha 0.5
+
+# Faithfulness component only
+--mode faith_only --alpha 0.5
+```
+
+Alpha sensitivity uses `--mode find` and one of:
+
+```text
+--alpha 0
+--alpha 0.25
+--alpha 0.375
+--alpha 0.5
+--alpha 0.625
+--alpha 0.75
+--alpha 1
+--alpha 2
+```
+
+Use a fresh `--weighted-jsonl` and `--output-dir` for every method, dataset,
+model scale, alpha, and seed. `--reuse-weighted-jsonl` is intended only for an
+exactly matching configuration.
+
+### Qwen3-4B scale
+
+Replace the base model while keeping all other settings fixed:
+
+```bash
+--base-model Qwen/Qwen3-4B
+```
+
+## Self-Demo
+
+Self-Demo follows prompt optimization, model self-scoring, critique/rewrite,
+No-RAG/RAG/refusal candidate generation, and tournament selection. The selected
+self-generated targets are trained with the same full-model SFT configuration.
+
+Prepare MSMARCO:
+
+```bash
+python self_demo.py --dataset msmarco --stage prepare \
+  --base-model Qwen/Qwen3-14B --seed 42
+```
+
+Generate and select demonstrations with all eight GPUs:
+
+```bash
+conda run -n tide-vllm python self_demo.py \
+  --dataset msmarco --stage vllm \
+  --base-model Qwen/Qwen3-14B \
+  --tensor-parallel-size 8 \
+  --cuda-visible-devices 0,1,2,3,4,5,6,7 \
+  --seed 42
+```
+
+Train the selected demonstrations:
+
+```bash
+torchrun --standalone --nproc_per_node=8 self_demo.py \
+  --dataset msmarco --stage train \
+  --base-model Qwen/Qwen3-14B \
+  --deepspeed-config deepspeed_zero3.json \
+  --cuda-visible-devices 0,1,2,3,4,5,6,7 \
+  --seed 42
+```
+
+Use `--dataset newsqa` for NewsQA. Each dataset receives an isolated data,
+cache, and model directory automatically.
+
+## Generation and Evaluation
+
+Run generation and fixed-judge validation:
 
 ```bash
 python tide_evaluate.py \
   --stage all \
-  --input-jsonl data/eval.jsonl \
-  --model runs/tide_msmarco/model \
+  --input-jsonl data/prepared/evaluation.jsonl \
+  --output-dir runs/evaluation/msmarco_tide \
+  --model runs/msmarco/tide/model \
   --model-label TIDE \
   --judge-model Qwen/Qwen3-32B \
-  --output-dir runs/evaluation
+  --seed 42 --temperature 0
 ```
 
-The script writes:
+For Qwen3-4B policies, use `--judge-model Qwen/Qwen3-8B`.
 
-- `generations.jsonl`
-- `validated.jsonl`
-- `summary.json`
+The evaluator writes:
 
-Generation and validation can also be run separately using `--stage generate` and `--stage validate`.
+```text
+generations.jsonl   exact prompt, raw output, normalized answer, reference metrics
+validated.jsonl     raw judge JSON, parsed decisions, deterministic validity result
+summary.json         aggregate token and answer-level metrics
+```
 
-### Metric Definitions
+The fixed Qwen judge evaluates semantic correctness and context support. The
+deterministic validity stage rejects only empty answers, refusals, prompt/meta
+output, exact question copies, and visibly unfinished output. Raw decisions and
+all rejection reasons are retained in `validated.jsonl`.
 
-The current evaluation script reports:
+### Answer-level F1
 
-- Exact match.
-- Token-overlap precision, recall, and F1.
-- Judge correctness rate.
-- Judge support rate.
-- Faithful-and-correct rate.
+Let `C` be final-correct answers, `A` attempted answers, and `G` answerable
+examples:
 
-**The reported `token_f1` is different from the paper's answer-level F1.** Computing the paper's answer-level metric requires counts of correct answers, attempted answers, and answerable examples; the current summary function does not produce those counts.
+```text
+precision = C / A
+recall    = C / G
+F1        = 2 * precision * recall / (precision + recall)
+```
 
-Judge-based summary rates exclude judge parse failures, which are reported separately.
+`summary.json` reports `answer_precision`, `answer_recall`, and `answer_f1`.
+It also reports normalized token-overlap precision, recall, and F1 as separate
+diagnostic metrics.
 
-## Context-Faithfulness Evaluation
+## Faithfulness
 
-Evaluate whether generated answers are supported by their contexts:
+Faithfulness is the fraction of generated answers whose factual claims are all
+entailed by their supplied contexts. Reference correctness is not used by this
+metric.
 
 ```bash
 python faithfulness_judge.py \
-  --input-jsonl runs/evaluation/generations.jsonl \
-  --output-jsonl runs/evaluation/faithfulness.jsonl \
+  --input-jsonl runs/evaluation/msmarco_tide/generations.jsonl \
+  --output-jsonl runs/evaluation/msmarco_tide/faithfulness.jsonl \
   --judge-model Qwen/Qwen3-32B \
-  --dataset msmarco \
-  --max-new-tokens 128
+  --dataset msmarco
 ```
 
-Input records should contain a question, context, and an answer under `model_answer`, `prediction`, or `answer`.
+## Distributional Shift
 
-The output preserves the input fields and adds the raw judge response and a Boolean `faithful` decision. The aggregate score is the fraction of scored records marked faithful.
-
-The judge evaluates context support independently of reference-answer correctness.
-
-Do not use `--only-correct` for unconditional faithfulness. That option expects a Boolean `correct` field, whereas `tide_evaluate.py` writes `judge_correct`; an explicit field conversion is needed before using this filter.
-
-## KL-Divergence Evaluation
-
-Compute full-vocabulary forward KL in the direction:
+The KL script computes the full-vocabulary forward divergence at every retained
+generated-answer position, conditioned on the same prompt and response prefix:
 
 ```text
-KL(base model || trained model)
+D_i,t = KL(pi_base(.|X_i,y_i,<t) || pi_trained(.|X_i,y_i,<t))
+KL_hat = sum_i sum_t D_i,t / sum_i T_i
 ```
-
-The input JSONL must contain the exact rendered generation `prompt` and the generated answer under `model_answer`, `prediction`, or `answer`.
 
 ```bash
 python kl_divergence.py \
-  --base-model Qwen/Qwen3-4B \
-  --trained-model runs/tide_msmarco/model \
-  --input-jsonl data/generated_answers_with_prompts.jsonl \
-  --output-json runs/evaluation/kl.json \
-  --base-device cuda:0 \
-  --trained-device cuda:1
+  --base-model Qwen/Qwen3-14B \
+  --trained-model runs/msmarco/tide/model \
+  --input-jsonl runs/evaluation/msmarco_tide/generations.jsonl \
+  --output-json runs/evaluation/msmarco_tide/kl_base_to_model.json \
+  --base-device cuda:0 --trained-device cuda:1
 ```
 
-The script averages KL over retained answer tokens, including EOS when retained. The two models must have compatible tokenizers and vocabularies.
+## Reproduction Record
 
+For every reported run, retain:
+
+- Prepared JSONL and preparation summary
+- Weighted training JSONL
+- Training arguments and logs
+- Full model checkpoint
+- `generations.jsonl`
+- `validated.jsonl`
+- `summary.json`
+- Faithfulness JSONL
+- KL JSON
+- Git commit hash, random seed, model revisions, and environment lock
+
+The exact prompts used by generation, correctness judging, and faithfulness
+judging are constants in the corresponding scripts and are stored with raw
+outputs for auditability.

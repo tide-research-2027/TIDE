@@ -26,8 +26,6 @@ def response(row: Dict[str, Any]) -> str:
 
 
 def tokenized_sequence(tokenizer, prompt: str, answer: str, max_length: int) -> Tuple[List[int], int]:
-    if max_length < 2:
-        raise ValueError("--max-length must be at least 2")
     prompt_ids = tokenizer(prompt, add_special_tokens=False).input_ids
     full_ids = tokenizer(prompt + answer, add_special_tokens=False).input_ids
     if full_ids[: len(prompt_ids)] == prompt_ids:
@@ -36,9 +34,9 @@ def tokenized_sequence(tokenizer, prompt: str, answer: str, max_length: int) -> 
         answer_ids = tokenizer(answer, add_special_tokens=False).input_ids
     if tokenizer.eos_token_id is not None and (not answer_ids or answer_ids[-1] != tokenizer.eos_token_id):
         answer_ids.append(tokenizer.eos_token_id)
-    # Preserve the end of the prompt and the start of the generated answer.
-    prompt_ids = prompt_ids[-(max_length - 1) :]
-    answer_ids = answer_ids[: max_length - len(prompt_ids)]
+    if len(prompt_ids) + len(answer_ids) > max_length:
+        prompt_ids = prompt_ids[-max(1, max_length - len(answer_ids)) :]
+        answer_ids = answer_ids[: max(1, max_length - len(prompt_ids))]
     return prompt_ids + answer_ids, len(prompt_ids)
 
 
@@ -50,11 +48,11 @@ def forward_kl_for_answer(
     base_device: torch.device,
     trained_device: torch.device,
 ) -> Tuple[float, int]:
-    if len(ids) < 2 or prompt_length < 1 or prompt_length >= len(ids):
+    if len(ids) < 2 or prompt_length >= len(ids):
         return 0.0, 0
     base_input = torch.tensor([ids], dtype=torch.long, device=base_device)
     trained_input = torch.tensor([ids], dtype=torch.long, device=trained_device)
-    start = prompt_length - 1
+    start = max(prompt_length - 1, 0)
 
     with torch.inference_mode():
         base_logits = base_model(base_input, use_cache=False).logits[0, start:-1].float()

@@ -1,0 +1,10 @@
+torch==2.5.1
+transformers==4.51.3
+datasets==3.5.0
+accelerate==1.6.0
+deepspeed==0.16.7
+bitsandbytes==0.45.5
+numpy==1.26.4
+safetensors==0.5.3
+sentencepiece==0.2.0
+tqdm==4.67.1
