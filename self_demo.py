@@ -267,7 +267,7 @@ def make_answer_window(context: str, start: int, end: int, max_chars: int) -> st
 
 def choose_newsqa_example(example: Dict[str, Any], args: argparse.Namespace) -> Optional[Dict[str, Any]]:
     question = str(example.get("question") or "").strip()
-    context = str(example.get("context") or "").strip()
+    context = str(example.get("context") or "")
     refs = normalize_reference_answers(example.get("answers"))
     if not question or not context or not refs:
         return None
@@ -348,6 +348,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-answer-chars", type=int, default=100)
     parser.add_argument("--include-unselected-passages", type=int, default=0)
     parser.add_argument("--target-mode", choices=["selected", "gold"], default=os.environ.get("TARGET_MODE", "selected"))
+    parser.add_argument("--min-reference-f1", type=float, default=0.70)
+    parser.add_argument("--min-reference-precision", type=float, default=0.50)
+    parser.add_argument("--min-support-recall", type=float, default=0.75)
 
     parser.add_argument("--prompt-opt-steps", type=int, default=int(os.environ.get("PROMPT_OPT_STEPS", "10")))
     parser.add_argument("--prompt-opt-train-examples", type=int, default=int(os.environ.get("PROMPT_OPT_TRAIN_EXAMPLES", "100")))
@@ -1214,6 +1217,89 @@ def tournament_judge(
 
     return selected_predictions, selected_sources, candidates_by_row
 
+
+def metric_tokens(value: Any) -> List[str]:
+    return re.findall(r"[a-z0-9]+", str(value or "").lower())
+
+
+def overlap_scores(prediction: str, reference: str) -> Tuple[float, float, float]:
+    pred = Counter(metric_tokens(prediction))
+    ref = Counter(metric_tokens(reference))
+    if not pred or not ref:
+        score = float(pred == ref and bool(pred))
+        return score, score, score
+    overlap = sum((pred & ref).values())
+    precision = overlap / sum(pred.values())
+    recall = overlap / sum(ref.values())
+    f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+    return precision, recall, f1
+
+
+def context_support_recall(answer: str, context: str) -> float:
+    answer_tokens = metric_tokens(answer)
+    context_counts = Counter(metric_tokens(context))
+    if not answer_tokens:
+        return 0.0
+    supported = sum(1 for token in answer_tokens if context_counts[token] > 0)
+    return supported / len(answer_tokens)
+
+
+def strict_candidate_target(
+    row: Dict[str, Any],
+    tournament_winner: str,
+    candidates: Sequence[str],
+    args: argparse.Namespace,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Select only generated candidates using the thresholds reported in the paper."""
+    references = normalize_reference_answers(row.get("answers") or row.get("answer"))
+    context = "\n\n".join(passages(row, args.ndocs))
+    max_words = 14 if args.dataset == "msmarco" else 16
+    ordered: List[Tuple[str, str]] = [("tournament", tournament_winner)]
+    ordered.extend((f"candidate_{index}", value) for index, value in enumerate(candidates))
+    scored = []
+    seen = set()
+    for source, value in ordered:
+        answer = clean_text(value)
+        key = " ".join(metric_tokens(answer))
+        if not key or key in seen or len(answer.split()) > max_words:
+            continue
+        seen.add(key)
+        best = (0.0, 0.0, 0.0, "")
+        for reference in references:
+            precision, recall, f1 = overlap_scores(answer, reference)
+            if (f1, precision, recall) > (best[2], best[0], best[1]):
+                best = (precision, recall, f1, reference)
+        support = context_support_recall(answer, context)
+        item = {
+            "answer": answer,
+            "source": source,
+            "reference_precision": best[0],
+            "reference_recall": best[1],
+            "reference_f1": best[2],
+            "best_reference": best[3],
+            "support_recall": support,
+            "word_count": len(answer.split()),
+        }
+        if (
+            best[2] >= args.min_reference_f1
+            and best[0] >= args.min_reference_precision
+            and support >= args.min_support_recall
+        ):
+            scored.append(item)
+    if not scored:
+        return None, {"decision": "skip_no_strict_generated_candidate", "candidates": []}
+    scored.sort(
+        key=lambda item: (
+            item["source"] != "tournament",
+            -item["reference_f1"],
+            -item["reference_precision"],
+            -item["support_recall"],
+            item["word_count"],
+        )
+    )
+    chosen = scored[0]
+    return str(chosen["answer"]), {"decision": "select_generated_candidate", "chosen": chosen}
+
 def build_self_demo_jsonl(llm, tokenizer, args: argparse.Namespace, paths: Dict[str, Path]) -> None:
     from tqdm import tqdm
 
@@ -1258,6 +1344,7 @@ def build_self_demo_jsonl(llm, tokenizer, args: argparse.Namespace, paths: Dict[
 
     source_counts = Counter()
     skipped_empty = 0
+    skipped_strict = 0
     written = 0
     strategy_names = [name for name, _prompt, _use_rag in strategies]
     with output_path.open(mode, encoding="utf-8") as handle:
@@ -1280,9 +1367,14 @@ def build_self_demo_jsonl(llm, tokenizer, args: argparse.Namespace, paths: Dict[
                 llm, tokenizer, list(batch), all_predictions, strategies, args.ndocs, judge_params
             )
             for row, prediction, source, candidates in zip(batch, selected_predictions, selected_sources, final_candidates):
-                selected_target = clean_text(prediction or "") or None
-                if selected_target is None:
+                if not clean_text(prediction or ""):
                     skipped_empty += 1
+                    continue
+                selected_target, selection = strict_candidate_target(
+                    row, clean_text(prediction), candidates, args
+                )
+                if selected_target is None:
+                    skipped_strict += 1
                     continue
 
                 out = {
@@ -1291,6 +1383,7 @@ def build_self_demo_jsonl(llm, tokenizer, args: argparse.Namespace, paths: Dict[
                     "prediction_source": str(source or "tournament_winner"),
                     "predictions": candidates,
                     "prediction_sources": strategy_names,
+                    "strict_target_selection": selection,
                 }
 
                 source_counts[str(out["prediction_source"])] += 1
@@ -1306,13 +1399,21 @@ def build_self_demo_jsonl(llm, tokenizer, args: argparse.Namespace, paths: Dict[
         "max_examples": args.max_examples,
         "written": written,
         "skipped_empty_tournament_winner": skipped_empty,
+        "skipped_no_strict_generated_candidate": skipped_strict,
         "source_counts": dict(source_counts),
         "strategies": [name for name, _prompt, _use_rag in strategies],
         "no_rag_prompts": no_rag_prompts,
         "rag_prompts": rag_prompts,
         "batch_size": args.vllm_batch_size,
         "prompts_per_strat": args.prompts_per_strat,
-        "target_selection": "tournament",
+        "target_selection": "candidate_only_strict",
+        "thresholds": {
+            "minimum_reference_f1": args.min_reference_f1,
+            "minimum_reference_precision": args.min_reference_precision,
+            "minimum_support_recall": args.min_support_recall,
+            "maximum_answer_words": 14 if args.dataset == "msmarco" else 16,
+            "ndocs": args.ndocs,
+        },
         "ram_reference": {
             "get_demos": "https://github.com/facebookresearch/RAM/blob/main/projects/sd-ra-it/scripts/get_demos.py",
             "prompt_optimization": "https://github.com/facebookresearch/RAM/blob/main/projects/sd-ra-it/scripts/prompt_optimization.py",
@@ -1708,7 +1809,7 @@ def run_training_stage(args: argparse.Namespace, paths: Dict[str, Path]) -> None
 
     summary = {
         "method": "ram_style_self_demonstration_generated_answers_sft_los_single_file",
-        "selection_method": "ram_sd_rait_tournament_winner",
+        "selection_method": "ram_sd_rait_candidate_only_strict",
         "dataset": args.dataset,
         "base_model": args.base_model,
         "self_demo_jsonl": str(paths["self_demo_jsonl"]),
@@ -1790,6 +1891,12 @@ def stage_command(args: argparse.Namespace, stage: str) -> List[str]:
         str(args.include_unselected_passages),
         "--target-mode",
         args.target_mode,
+        "--min-reference-f1",
+        str(args.min_reference_f1),
+        "--min-reference-precision",
+        str(args.min_reference_precision),
+        "--min-support-recall",
+        str(args.min_support_recall),
         "--prompt-opt-steps",
         str(args.prompt_opt_steps),
         "--prompt-opt-train-examples",

@@ -165,7 +165,7 @@ def answer_window(context: str, start: int, end: int, max_chars: int) -> str:
 def choose_newsqa_answer(
     example: Dict[str, Any], max_context_chars: int, max_answer_words: int, max_answer_chars: int
 ) -> tuple[Optional[str], Optional[str]]:
-    context = clean_text(example.get("context"))
+    context = str(example.get("context") or "")
     references = extract_answers(example.get("answers"))
     reference_norms = {normalize_for_match(ref) for ref in references if normalize_for_match(ref)}
 
@@ -182,14 +182,20 @@ def choose_newsqa_answer(
         answer = clean_text(matching_ref or span)
         if reference_norms and normalize_for_match(answer) not in reference_norms:
             answer = span
-        if len(answer) > max_answer_chars or len(re.findall(r"\w+", answer)) > max_answer_words:
+        if max_answer_chars > 0 and len(answer) > max_answer_chars:
+            continue
+        if max_answer_words > 0 and len(re.findall(r"\w+", answer)) > max_answer_words:
             continue
         if normalize_for_match(answer) in {"unknown", "cannot answer", "no answer present"}:
             continue
         context_window = answer_window(context, start, end, max_context_chars)
         if normalize_for_match(answer) not in normalize_for_match(context_window):
             continue
-        return answer, context_window
+        return answer, clean_text(context_window)
+    for reference in references:
+        start = context.lower().find(reference.lower())
+        if start >= 0:
+            return clean_text(reference), clean_text(answer_window(context, start, start + len(reference), max_context_chars))
     return None, None
 
 
@@ -215,9 +221,6 @@ def load_training_rows(args) -> List[Dict[str, Any]]:
 
     if args.dataset == "msmarco":
         ds = load_dataset("microsoft/ms_marco", "v1.1", split=args.split)
-        if args.max_samples >= 0:
-            ds = ds.select(range(min(args.max_samples, len(ds))))
-
         for ex in ds:
             question = clean_text(ex.get("query"))
             context = selected_msmarco_passage(ex)
@@ -234,15 +237,14 @@ def load_training_rows(args) -> List[Dict[str, Any]]:
                         "prompt": qa_prompt(question, context),
                     }
                 )
+                if args.max_samples >= 0 and len(rows) >= args.max_samples:
+                    break
 
     elif args.dataset == "newsqa":
         all_splits = load_dataset("lucadiliello/newsqa")
         if args.split not in all_splits:
             raise ValueError(f"NewsQA split {args.split!r} is unavailable: {list(all_splits)}")
         ds = all_splits[args.split]
-        if args.max_samples >= 0:
-            ds = ds.select(range(min(args.max_samples, len(ds))))
-
         for ex in ds:
             question = clean_text(ex.get("question"))
             answer, context = choose_newsqa_answer(
@@ -264,10 +266,17 @@ def load_training_rows(args) -> List[Dict[str, Any]]:
                         "prompt": qa_prompt(question, context),
                     }
                 )
+                if args.max_samples >= 0 and len(rows) >= args.max_samples:
+                    break
 
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
+    if args.max_samples >= 0 and len(rows) != args.max_samples:
+        raise RuntimeError(
+            f"Requested {args.max_samples} retained {args.dataset} examples, "
+            f"but preprocessing produced {len(rows)} from split {args.split!r}."
+        )
     return rows
 
 
@@ -615,8 +624,8 @@ def parse_args():
     parser.add_argument("--split", default="train")
     parser.add_argument("--max-samples", type=int, default=75000)
     parser.add_argument("--newsqa-context-chars", type=int, default=1400)
-    parser.add_argument("--newsqa-max-answer-words", type=int, default=16)
-    parser.add_argument("--newsqa-max-answer-chars", type=int, default=100)
+    parser.add_argument("--newsqa-max-answer-words", type=int, default=0)
+    parser.add_argument("--newsqa-max-answer-chars", type=int, default=0)
 
     parser.add_argument("--base-model", default=BASE_MODEL)
     parser.add_argument("--nli-model", default=NLI_MODEL)

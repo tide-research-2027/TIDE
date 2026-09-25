@@ -26,6 +26,7 @@ experiment uses Qwen3-4B and Qwen3-8B, respectively.
 | `tide_train.py` | TIDE/FIND, SFT, Less-Value, and Faith-Only full-model training |
 | `self_demo.py` | Prompt optimization, Self-Demo generation, tournament selection, and training |
 | `prepare_dataset.py` | Dataset-independent conversion to canonical QA JSONL |
+| `prepare_benchmarks.py` | Exact five-benchmark evaluation constructors and paper sizes |
 | `tide_evaluate.py` | Generation, fixed-judge evaluation, and metrics |
 | `faithfulness_judge.py` | Context faithfulness with a fixed Qwen judge |
 | `kl_divergence.py` | Token-weighted full-vocabulary `KL(base || trained)` |
@@ -91,6 +92,18 @@ python prepare_dataset.py \
 Preparation writes a JSON summary containing accepted/skipped counts, output
 paths, seed, and schema. Preserve this summary with every experiment.
 
+Prepare the reported evaluation sets:
+
+```bash
+for dataset in msmarco hotpotqa nq wow trex; do
+  python prepare_benchmarks.py --dataset "$dataset" \
+    --output-jsonl "data/evaluation/${dataset}.jsonl" --seed 42
+done
+```
+
+This produces MSMARCO `6,789`, HotpotQA `7,000`, NQ `3,610`, WoW `7,866`,
+and T-REx `7,000` examples using the constructions described in the paper.
+
 ## Full-Parameter Training
 
 All methods use the same base model, optimizer settings, learning rate,
@@ -110,7 +123,21 @@ torchrun --standalone --nproc_per_node=8 tide_train.py \
   --deepspeed deepspeed_zero3.json
 ```
 
-For NewsQA, change `--dataset newsqa` and the output paths.
+For NewsQA, run a separate job with the reported retained count:
+
+```bash
+torchrun --standalone --nproc_per_node=8 tide_train.py \
+  --dataset newsqa --mode find \
+  --base-model Qwen/Qwen3-14B \
+  --nli-model MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli \
+  --alpha 0.5 --max-samples 71719 --seed 42 \
+  --weighted-jsonl runs/newsqa/tide/weighted.jsonl \
+  --output-dir runs/newsqa/tide/model \
+  --deepspeed deepspeed_zero3.json
+```
+
+MSMARCO and NewsQA are always trained as separate jobs; the training loader
+does not concatenate or mix datasets.
 
 ### Baselines and ablations
 
@@ -146,17 +173,26 @@ exactly matching configuration.
 
 ### Qwen3-4B scale
 
-Replace the base model while keeping all other settings fixed:
+The 4B experiment uses four GPUs and gradient accumulation eight:
 
 ```bash
---base-model Qwen/Qwen3-4B
+torchrun --standalone --nproc_per_node=4 tide_train.py \
+  --dataset msmarco --mode find \
+  --base-model Qwen/Qwen3-4B --alpha 0.5 \
+  --max-samples 75000 --per-device-batch-size 1 \
+  --gradient-accumulation-steps 8 --seed 42 \
+  --weighted-jsonl runs/4b/msmarco/tide/weighted.jsonl \
+  --output-dir runs/4b/msmarco/tide/model \
+  --deepspeed deepspeed_zero3.json
 ```
 
 ## Self-Demo
 
 Self-Demo follows prompt optimization, model self-scoring, critique/rewrite,
-No-RAG/RAG/refusal candidate generation, and tournament selection. The selected
-self-generated targets are trained with the same full-model SFT configuration.
+No-RAG/RAG/refusal candidate generation, and tournament selection. Candidate-only
+strict selection uses minimum reference F1 `0.70`, reference precision `0.50`,
+support recall `0.75`, `ndocs=4`, and answer caps of 14 words for MSMARCO and
+16 words for NewsQA. Gold-reference fallback is never used as a training target.
 
 Prepare MSMARCO:
 
@@ -202,10 +238,15 @@ python tide_evaluate.py \
   --model runs/msmarco/tide/model \
   --model-label TIDE \
   --judge-model Qwen/Qwen3-32B \
+  --dataset-profile msmarco \
   --seed 42 --temperature 0
 ```
 
 For Qwen3-4B policies, use `--judge-model Qwen/Qwen3-8B`.
+
+The evaluation profile automatically sets generation/judge limits to
+`32/192` for MSMARCO, `24/192` for HotpotQA, `32/192` for NQ, `64/192`
+for WoW, and `16/160` for T-REx. Both generation and judging are greedy.
 
 The evaluator writes:
 

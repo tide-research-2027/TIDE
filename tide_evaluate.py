@@ -48,6 +48,14 @@ automatically correct. Prefer false when uncertain.
 Return ONLY valid JSON with exactly these keys:
 {"correct": true, "supported": true, "reason": "short reason"}"""
 
+DECODING_PROFILES = {
+    "msmarco": {"generation": 32, "judge": 192},
+    "hotpotqa": {"generation": 24, "judge": 192},
+    "nq": {"generation": 32, "judge": 192},
+    "wow": {"generation": 64, "judge": 192},
+    "trex": {"generation": 16, "judge": 160},
+}
+
 ARTICLES = re.compile(r"\b(a|an|the)\b", re.IGNORECASE)
 SPACE = re.compile(r"\s+")
 THINK_BLOCK = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
@@ -73,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", required=True)
     p.add_argument("--model-label", default="model")
     p.add_argument("--judge-model", default="Qwen/Qwen3-32B")
+    p.add_argument("--dataset-profile", choices=sorted(DECODING_PROFILES), required=True)
     p.add_argument("--id-field", default="id")
     p.add_argument("--question-field", default="question")
     p.add_argument("--context-field", default="context")
@@ -84,9 +93,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--judge-batch-size", type=int, default=4)
     p.add_argument("--max-input-tokens", type=int, default=4096)
-    p.add_argument("--max-new-tokens", type=int, default=64)
+    p.add_argument("--max-new-tokens", type=int, default=None)
     p.add_argument("--judge-max-input-tokens", type=int, default=4096)
-    p.add_argument("--judge-max-new-tokens", type=int, default=128)
+    p.add_argument("--judge-max-new-tokens", type=int, default=None)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--dtype", choices=["auto", "bf16", "fp16", "fp32"], default="bf16")
@@ -164,10 +173,12 @@ def standardize_rows(args: argparse.Namespace) -> List[Dict[str, Any]]:
         answerable_value = dotted_get(source, args.answerable_field) if args.answerable_field else bool(answers)
         rows.append({
             "id": str(dotted_get(source, args.id_field, index)),
+            "dataset": str(source.get("dataset") or args.dataset_profile),
             "question": question,
             "context": context,
             "answers": answers,
             "answerable": bool(answerable_value),
+            "metadata": source.get("metadata") if isinstance(source.get("metadata"), Mapping) else {},
             "prediction": clean_answer(dotted_get(source, args.prediction_field, "")),
             "source": source,
         })
@@ -309,6 +320,11 @@ def completed_ids(path: Path) -> set[str]:
 
 
 def generation_user(row: Mapping[str, Any]) -> str:
+    if row.get("dataset") == "wow":
+        return f"CONVERSATION:\n{row['question']}\n\nKNOWLEDGE:\n{row['context']}\n\nNEXT REPLY:"
+    if row.get("dataset") == "trex":
+        head = (row.get("metadata") or {}).get("head", "")
+        return f"HEAD ENTITY:\n{head}\n\nCONTEXT:\n{row['context']}\n\nASSOCIATED ENTITY OR VALUE:"
     return f"QUESTION:\n{row['question']}\n\nCONTEXT:\n{row['context']}\n\nANSWER:"
 
 
@@ -369,6 +385,7 @@ def run_generation(args: argparse.Namespace, rows: List[Dict[str, Any]], output:
         prediction = clean_answer(raw)
         records.append({
             "id": row["id"], "model_label": args.model_label,
+            "dataset": row["dataset"], "metadata": row["metadata"],
             "question": row["question"], "context": row["context"],
             "answers": row["answers"], "answerable": row["answerable"],
             "prompt": prompt, "prediction": prediction,
@@ -459,6 +476,11 @@ def summarize(validated: Path, summary: Path) -> None:
 
 def main() -> None:
     args = parse_args()
+    profile = DECODING_PROFILES[args.dataset_profile]
+    if args.max_new_tokens is None:
+        args.max_new_tokens = profile["generation"]
+    if args.judge_max_new_tokens is None:
+        args.judge_max_new_tokens = profile["judge"]
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     output_dir = Path(args.output_dir)
@@ -480,6 +502,7 @@ def main() -> None:
             for row in supplied:
                 records.append({
                     "id": row["id"], "model_label": args.model_label,
+                    "dataset": row["dataset"], "metadata": row["metadata"],
                     "question": row["question"], "context": row["context"],
                     "answers": row["answers"], "answerable": row["answerable"],
                     "prompt": generation_user(row), "prediction": row["prediction"],
