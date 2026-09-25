@@ -26,7 +26,7 @@ experiment uses Qwen3-4B and Qwen3-8B, respectively.
 | `tide_train.py` | TIDE/FIND, SFT, Less-Value, and Faith-Only full-model training |
 | `self_demo.py` | Prompt optimization, Self-Demo generation, tournament selection, and training |
 | `prepare_dataset.py` | Dataset-independent conversion to canonical QA JSONL |
-| `tide_evaluate.py` | Generation, Qwen judging, deterministic validity checks, and metrics |
+| `tide_evaluate.py` | Generation, fixed-judge evaluation, and metrics |
 | `faithfulness_judge.py` | Context faithfulness with a fixed Qwen judge |
 | `kl_divergence.py` | Token-weighted full-vocabulary `KL(base || trained)` |
 | `deepspeed_zero3.json` | Full-parameter ZeRO-3 configuration |
@@ -211,14 +211,14 @@ The evaluator writes:
 
 ```text
 generations.jsonl   exact prompt, raw output, normalized answer, reference metrics
-validated.jsonl     raw judge JSON, parsed decisions, deterministic validity result
+validated.jsonl     raw judge JSON, parsed decisions, and final correctness
 summary.json         aggregate token and answer-level metrics
 ```
 
-The fixed Qwen judge evaluates semantic correctness and context support. The
-deterministic validity stage rejects only empty answers, refusals, prompt/meta
-output, exact question copies, and visibly unfinished output. Raw decisions and
-all rejection reasons are retained in `validated.jsonl`.
+The fixed Qwen judge evaluates semantic correctness and context support. Final
+correctness also applies fixed output-validity checks implemented in the
+evaluation script. Raw decisions and associated reasons are retained in
+`validated.jsonl`.
 
 ### Answer-level F1
 
