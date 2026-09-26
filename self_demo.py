@@ -1,27 +1,3 @@
-#!/usr/bin/env python3
-# coding: utf-8
-"""Complete dataset-neutral RAM/SD-RA-IT-style Self-Demo training.
-
-This one file performs the full pipeline:
-1. Prepare MS MARCO train rows.
-2. Optimize no-RAG and RAG system messages with iterative generate/score/critique/rewrite.
-3. Generate NoRag/Rag/RagRefuse candidates, select by tournament judging, then
-   apply a strict paper-faithful correctness/support/human-quality filter.
-4. Fine-tune Qwen3-14B on the generated self-demo answers with the same
-   unweighted SFT LOS loss path used by weighted_loss_training_weighted_fix_v2.py:
-   w_fixed=1, faithfulness_fixed=0, use_weighted_logits=False.
-
-This variant is deliberately comparable to the Facebook RAM scripts:
-projects/sd-ra-it/scripts/prompt_optimization.py and get_demos.py.  The
-additional filter is needed because our validation is a strict answer-only,
-no-false-positive evaluator.  Since these MSMARCO rows are answer-present by
-construction, rows with no clean self-generated candidate are skipped by
-default rather than turned into false-refusal training examples.
-
-The script intentionally imports vLLM only inside the vLLM stage. The default
-`--stage all` command runs this same file once under the vLLM environment for
-generation, then trains in the current environment.
-"""
 
 from __future__ import annotations
 
